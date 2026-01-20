@@ -24,6 +24,38 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from datetime import datetime
+native_print = print
+ 
+def print_to_log(*args, sep=' ', end='\n', file=sys.stdout, flush=False):
+    """
+    改造后的print函数：同时输出到控制台和日志文件
+    :param args: print的原始参数（要输出的内容）
+    :param sep: 分隔符，默认空格
+    :param end: 结束符，默认换行
+    :param file: 原始print的输出流（保留兼容）
+    :param flush: 是否立即刷新缓冲区
+    """
+    # 1. 拼接要输出的内容（模拟print的拼接逻辑）
+    if not wait_flag or get_tensor_model_parallel_rank() != 0:
+        return
+    content = sep.join(map(str, args)) + end
+    
+    # 2. 写入日志文件（追加模式，UTF-8编码避免中文乱码）
+    log_filename = f"./logs/app_{datetime.now().strftime('%Y%m%d')}.log"  # 按日期生成日志文件名
+ 
+    with open(log_filename, 'a', encoding='utf-8') as f:
+        # 增加时间戳，让日志更规范
+        log_content = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {content}"
+        f.write(log_content)
+    
+ 
+print = print_to_log
+ 
+wait_flag = False
+
+
 import psutil
 import setproctitle
 import torch
@@ -678,9 +710,7 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        if (
-            server_args.disaggregation_mode == "decode"
-            and server_args.disaggregation_decode_enable_offload_kvcache
+        if (server_args.disaggregation_decode_enable_offload_kvcache
         ):
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
@@ -709,6 +739,8 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        self.waiting_queue2: List[Req] = []
+        self.retracted_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -1063,6 +1095,8 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self.process_decode_queue()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1099,8 +1133,14 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self.process_decode_queue()
+
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            global wait_flag
+            if wait_flag:
+                batch = self.get_next_disagg_decode_batch_to_run()
+            else:
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1115,6 +1155,8 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                if len(self.retracted_queue) + len(self.waiting_queue2)  == 0 :
+                    wait_flag = False
 
             # Process the last batch
             if self.last_batch:
@@ -1580,7 +1622,14 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-        if self.disaggregation_mode == DisaggregationMode.NULL:
+        if is_retracted:
+            global wait_flag
+            wait_flag = True
+            self.retracted_queue.append(req)
+            self._prefetch_kvcache(req)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+        elif self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):
@@ -1782,7 +1831,9 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        if not new_prebuilt_batch:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -2691,6 +2742,263 @@ class Scheduler(
 
     def get_remote_instance_transfer_engine_info(self):
         return self.tp_worker.get_remote_instance_transfer_engine_info()
+
+
+    def process_decode_queue(self):
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()
+ 
+        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+        resumed_reqs = self.resume_retracted_reqs()
+        self.waiting_queue2.extend(resumed_reqs)
+        print_to_log(f"len(self.waiting_queue2): {len(self.waiting_queue2)}, len(self.retracted_queue):{len(self.retracted_queue)} ")
+        return
+
+    def resume_retracted_reqs(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> List[Req]:
+        # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+
+        # allocate memory
+        resumed_reqs = []
+        indices_to_remove = set()
+        allocatable_tokens = self._allocatable_tokens(count_retracted=False)
+
+        for i, req in enumerate(self.retracted_queue):
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+
+            if self.req_to_token_pool.available_size() <= 0:
+                break
+
+            required_tokens_for_request = (
+                len(req.origin_input_ids)
+                + len(req.output_ids)
+                + self.server_args.num_reserved_decode_tokens
+            )
+            if required_tokens_for_request > allocatable_tokens:
+                break
+
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
+            req.is_retracted = False
+            self._pre_alloc(req)
+            allocatable_tokens -= required_tokens_for_request
+
+            # load from cpu, release the cpu copy
+            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+
+        self.retracted_queue = [
+            entry
+            for i, entry in enumerate(self.retracted_queue)
+            if i not in indices_to_remove
+        ]
+
+        return resumed_reqs
+
+    def _allocatable_tokens(
+        self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
+    ) -> int:
+        need_space_for_single_req = (
+            max(
+                [
+                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    + len(x.origin_input_ids)
+                    - retractable_tokens
+                    for x in self.running_batch.reqs
+                ]
+            )
+            if retractable_tokens is not None
+            and len(self.running_batch.reqs) > 0
+            else 0
+        )
+
+        if self.model_config.is_hybrid_swa:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+
+        allocatable_tokens = available_size - max(
+            # preserve some space for future decode
+            self.server_args.num_reserved_decode_tokens
+            * (
+                len(self.running_batch.reqs)
+                + len(self.waiting_queue)
+                + len(self.waiting_queue2)
+            ),
+            # make sure each request can finish if reach max_tokens with all other requests retracted
+            need_space_for_single_req,
+        )
+
+        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
+        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
+        if (
+            self.last_batch
+            and self.last_batch.forward_mode.is_prebuilt()
+        ):
+            allocatable_tokens -= self.server_args.num_reserved_decode_tokens * len(
+                self.last_batch.reqs
+            )
+
+        if count_retracted:
+            allocatable_tokens -= sum(
+                [
+                    len(req.origin_input_ids)
+                    + len(req.output_ids)
+                    + self.server_args.num_reserved_decode_tokens
+                    for req in self.retracted_queue
+                ]
+            )
+        return allocatable_tokens
+
+
+    def _pre_alloc(self, req: Req) -> torch.Tensor:
+        """Pre-allocate the memory for req_to_token and token_kv_pool"""
+        req_pool_indices = self.req_to_token_pool.alloc(1)
+
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
+
+        req.req_pool_idx = req_pool_indices[0]
+
+        # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        req.kv_allocated_len = fill_len
+        req.kv_committed_len = fill_len
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+        else:
+            device = self.token_to_kv_pool_allocator.device
+            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
+            )
+
+        assert (
+            kv_loc is not None
+        ), "KV cache is full! There is a bug in memory estimation."
+
+        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+
+        # populate metadata
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.set_extend_input_len(len(req.fill_ids))
+
+        return kv_loc
+
+    def get_new_prebuilt_batch(self):
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno} len(self.retracted_queue):{len(self.retracted_queue)} len(self.waiting_queue2):{len(self.waiting_queue2)}")
+        """Create a schedulebatch for fake completed prefill"""
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        if len(self.waiting_queue2) == 0:
+            return None
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        curr_batch_size = self.running_batch.batch_size()
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        num_not_used_batch = batch_size - curr_batch_size
+        print_to_log(f"\
+            num_not_used_batch:{num_not_used_batch} = batch_size:{batch_size} - curr_batch_size:{curr_batch_size}\
+                ")
+        # pop req from waiting queue
+        can_run_list: List[Req] = []
+        waiting_queue2: List[Req] = []
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        for i in range(len(self.waiting_queue2)):
+            req = self.waiting_queue2[i]
+            # we can only add at least `num_not_used_batch` new batch to the running queue
+            if i < num_not_used_batch:
+                can_run_list.append(req)
+                req.add_latency(RequestStage.DECODE_WAITING)
+                req.init_next_round_input(self.tree_cache)
+            else:
+                waiting_queue2.append(req)
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        self.waiting_queue2 = waiting_queue2
+        if len(can_run_list) == 0:
+            return None
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        print_to_log(f"get_new_prebuilt_batch in ")
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
+
+        # construct a schedule batch with those requests and mark as decode
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+
+        # construct fake completed prefill
+        new_batch.prepare_for_prebuilt()
+        new_batch.process_prebuilt(self.server_args, self.future_map)
+        # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        # if new_batch:
+            # print_to_log(f"当前文件: {sys._getframe().f_code.co_filename}, 方法: {sys._getframe().f_code.co_name}, 行号: {sys._getframe().f_lineno}")
+        return new_batch
+    
+    def get_next_disagg_decode_batch_to_run(self) -> Optional[ScheduleBatch]:
+        """Create fake completed prefill if possible and merge with running batch"""
+        # Merge the prefill batch into the running batch
+        last_batch = self.last_batch
+        if last_batch and last_batch.forward_mode.is_prebuilt():
+            # chunked prefill doesn't happen in decode instance.
+            assert self.chunked_req is None
+            # Filter finished batches.
+            last_batch.filter_batch()
+            if not last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = last_batch
+                else:
+                    # merge running_batch with prefill batch
+                    self.running_batch.merge_batch(last_batch)
+
+        new_prebuilt_batch = self.get_new_prebuilt_batch()
+
+        ret: Optional[ScheduleBatch] = None
+        if new_prebuilt_batch:
+            ret = new_prebuilt_batch
+        else:
+            if self.running_batch.is_empty():
+                ret = None
+            else:
+                self.running_batch = self.update_running_batch(self.running_batch)
+                global wait_flag
+                if len(self.retracted_queue) + len(self.waiting_queue2)  == 0 :
+                    wait_flag = False
+                ret = self.running_batch if not self.running_batch.is_empty() else None
+
+        # 1. decode + None -> decode + idle
+        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
+        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
+        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(ret)
+
+        if ret:
+            trace_event_batch("schedule", ret.reqs)
+        return ret
+
 
 
 class IdleSleeper:
