@@ -546,6 +546,10 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        # offload kv cache info
+        self.seqlen
+        self.kv_cache_cpu = []
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
